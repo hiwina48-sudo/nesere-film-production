@@ -1,244 +1,105 @@
 <?php
 /**
- * NESERE Film Production - Customer Payment Page (customer/pay.php)
- * Handles payment submission safely matching existing database columns
- * Luxury Black & Gold Theme | Bilingual (AM/EN)
+ * NESERE Film Production - Manual Payment Submission
+ * Customers submit payment method, transaction reference and receipt.
  */
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/auth_check.php';
 
 $db = db();
-$customer_id = (int)($_SESSION['user']['customer_id'] ?? ($_SESSION['user']['user_id'] ?? 0));
-$request_id = (int)($_GET['id'] ?? 0);
-
+$customer_id = (int)($_SESSION['user']['customer_id'] ?? ($_SESSION['user']['user_id'] ?? ($_SESSION['user_id'] ?? 0)));
+$request_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT) ?: 0;
 $current_lang = $_SESSION['lang'] ?? 'am';
 if (isset($_GET['lang'])) {
     $current_lang = $_GET['lang'] === 'en' ? 'en' : 'am';
     $_SESSION['lang'] = $current_lang;
 }
+$isAm = $current_lang === 'am';
+$t = static function (string $am, string $en) use ($isAm): string { return $isAm ? $am : $en; };
 
-// የትዕዛዙን መረጃ ማምጣት
-$stmt = $db->prepare("SELECT * FROM service_requests WHERE request_id = ? AND customer_id = ?");
+$stmt = $db->prepare('SELECT * FROM service_requests WHERE request_id = ? AND customer_id = ? LIMIT 1');
 $stmt->execute([$request_id, $customer_id]);
-$order = $stmt->fetch();
-
+$order = $stmt->fetch(PDO::FETCH_ASSOC);
 if (!$order) {
     redirect('requests.php');
 }
 
 $error = '';
+$methods = ['Bank of Abyssinia', 'Commercial Bank of Ethiopia', 'Telebirr', 'CBE Birr'];
+$allowedSlips = [
+    'jpg' => ['image/jpeg'],
+    'jpeg' => ['image/jpeg'],
+    'png' => ['image/png'],
+    'webp' => ['image/webp'],
+    'pdf' => ['application/pdf'],
+];
+$paymentStatus = strtolower((string)($order['payment_status'] ?? 'unpaid'));
+$alreadySubmitted = in_array($paymentStatus, ['pending_verification', 'paid'], true);
 
-// የክፍያ ማረጋገጫ ፎርም ሲሰሚት ሲደረግ
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $payment_method = post('payment_method');
-    
-    try {
-        // ክፍያው መመዝገቡን እና status ቱን pending_verification መሆኑን ማዘመን (ያሉትን ኮለሞች ብቻ በመጠቀም)
-        $upd = $db->prepare("
-            UPDATE service_requests 
-            SET payment_status = 'pending_verification', 
-                payment_method = ? 
-            WHERE request_id = ?
-        ");
-        $upd->execute([$payment_method, $request_id]);
-
-        // 🎯 ክፍያው ተጠናቆ ሲመዝገብ በቀጥታ ወደ requests.php አረንጓዴ ቲክ ማሳሰቢያ ይዞ እንዲሄድ ማድረግ
-        redirect('requests.php?payment=success');
-    } catch (Exception $e) {
-        $error = 'Database Error: ' . $e->getMessage();
+    check_csrf();
+    if ($alreadySubmitted) {
+        $error = $t('ይህ ክፍያ ከዚህ በፊት ቀርቧል ወይም ጸድቋል።', 'This payment has already been submitted or approved.');
+    } else {
+        $payment_method = post('payment_method');
+        $payment_reference = substr(post('payment_reference'), 0, 100);
+        if (!in_array($payment_method, $methods, true)) {
+            $error = $t('ትክክለኛ የክፍያ መንገድ ይምረጡ።', 'Please choose a valid payment method.');
+        } elseif (empty($_FILES['payment_slip']) || ($_FILES['payment_slip']['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) {
+            $error = $t('የክፍያ ደረሰኝዎን ይጫኑ።', 'Please upload your payment receipt or screenshot.');
+        } else {
+            [$slipName, $uploadError] = upload_file('payment_slip', $allowedSlips, 'pay_', 5 * 1024 * 1024);
+            if ($uploadError !== null) {
+                $error = $uploadError;
+            } elseif (!$slipName) {
+                $error = $t('ደረሰኙን ማስቀመጥ አልተቻለም። እንደገና ይሞክሩ።', 'Could not save the receipt. Please try again.');
+            } else {
+                try {
+                    $upd = $db->prepare("UPDATE service_requests
+                        SET payment_status = 'Pending_Verification', payment_method = ?, payment_slip = ?, payment_reference = ?
+                        WHERE request_id = ? AND customer_id = ? AND payment_status = 'Unpaid'");
+                    $upd->execute([$payment_method, $slipName, ($payment_reference !== '' ? $payment_reference : null), $request_id, $customer_id]);
+                    if ($upd->rowCount() !== 1) {
+                        delete_upload($slipName);
+                        $error = $t('የክፍያ ሁኔታው ተቀይሯል። ገጹን አድስና እንደገና ይመልከቱ።', 'The payment status changed. Refresh the page and try again.');
+                    } else {
+                        flash('success', $t('የክፍያ ማረጋገጫዎ ተልኳል። Admin እስኪያረጋግጠው ድረስ በግምገማ ላይ ይቆያል።', 'Payment proof submitted. It will remain under review until an administrator verifies it.'));
+                        redirect('requests.php?payment=success');
+                    }
+                } catch (Throwable $e) {
+                    if ($slipName) delete_upload($slipName);
+                    error_log('Manual payment submission failed: ' . $e->getMessage());
+                    $error = $t('ክፍያውን መመዝገብ አልተቻለም። ዳታቤዙን ያረጋግጡና እንደገና ይሞክሩ።', 'Could not record the payment. Check the database and try again.');
+                }
+            }
+        }
     }
 }
 
-$page_title = ($current_lang === 'am') ? 'ክፍያ መፈጸሚያ | ንስር ፊልም ፕሮዳክሽን' : 'Payment Portal | Nesere Film Production';
+$page_title = $t('ክፍያ መፈጸሚያ | ንስር ፊልም ፕሮዳክሽን', 'Manual Payment | Nesere Film Production');
 ?>
-<!DOCTYPE html>
-<html lang="<?= $current_lang ?>">
+<!doctype html>
+<html lang="<?= $isAm ? 'am' : 'en' ?>">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= htmlspecialchars($page_title) ?></title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root {
-            --bg-dark: #0B0B0B;
-            --card-dark: #121316;
-            --border-dark: #1E2026;
-            --gold: #D4AF37;
-            --gold-light: #F2D16B;
-            --text-muted: #8E929D;
-            --text-white: #FFFFFF;
-        }
-        body {
-            background-color: var(--bg-dark);
-            color: var(--text-white);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            margin: 0;
-            padding: 0;
-        }
-        .pay-container {
-            max-width: 800px;
-            margin: 40px auto 80px;
-            padding: 0 20px;
-        }
-        .top-nav {
-            margin-bottom: 25px;
-        }
-        .top-nav a {
-            color: var(--gold);
-            text-decoration: none;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        .card {
-            background: var(--card-dark);
-            border: 1px solid var(--border-dark);
-            border-radius: 14px;
-            padding: 35px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-        }
-        h2 {
-            margin-top: 0;
-            color: #fff;
-            font-size: 24px;
-            border-bottom: 1px solid var(--border-dark);
-            padding-bottom: 15px;
-            margin-bottom: 25px;
-        }
-        .order-summary {
-            background: #16171D;
-            border: 1px solid var(--border-dark);
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 30px;
-        }
-        .order-summary p {
-            margin: 8px 0;
-            font-size: 14px;
-            color: #d1d1d6;
-        }
-        .bank-accounts-box {
-            margin-bottom: 30px;
-        }
-        .bank-item {
-            background: #181920;
-            border: 1px solid var(--border-dark);
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 12px;
-        }
-        .bank-item h4 {
-            margin: 0 0 5px 0;
-            color: var(--gold);
-            font-size: 15px;
-        }
-        .bank-item p {
-            margin: 3px 0;
-            font-size: 13.5px;
-            color: #fff;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            font-size: 13.5px;
-            color: var(--text-muted);
-            margin-bottom: 8px;
-        }
-        select, input[type="text"] {
-            width: 100%;
-            padding: 12px;
-            background: #181920;
-            border: 1px solid var(--border-dark);
-            border-radius: 8px;
-            color: #fff;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        select:focus, input:focus {
-            border-color: var(--gold);
-            outline: none;
-        }
-        .btn-submit {
-            display: block;
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, var(--gold-light), var(--gold));
-            color: #000;
-            border: none;
-            border-radius: 8px;
-            font-size: 15px;
-            font-weight: 800;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .btn-submit:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(212, 175, 55, 0.3);
-        }
-        .alert-error {
-            background: rgba(231, 76, 60, 0.15);
-            border: 1px solid #e74c3c;
-            color: #e74c3c;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 13.5px;
-        }
-    </style>
-</head>
-<body>
-
-<div class="pay-container">
-    <div class="top-nav">
-        <a href="requests.php">← <?= ($current_lang === 'am') ? 'ወደ ትዕዛዞች ዝርዝር ተመለስ' : 'Back to Requests' ?></a>
-    </div>
-
-    <div class="card">
-        <h2><?= ($current_lang === 'am') ? 'የክፍያ ማረጋገጫ ማጠናቀቂያ' : 'Complete Payment' ?></h2>
-
-        <?php if (!empty($error)): ?>
-            <div class="alert-error"><?= htmlspecialchars($error) ?></div>
-        <?php endif; ?>
-
-        <!-- የትዕዛዝ ማጠቃለያ -->
-        <div class="order-summary">
-            <p><strong><?= ($current_lang === 'am') ? 'የፕሮጀክት ርዕስ፡' : 'Project Title:' ?></strong> <?= htmlspecialchars($order['project_title']) ?></p>
-            <p><strong><?= ($current_lang === 'am') ? 'ሊከፈል የሚገባው ጠቅላላ ዋጋ፡' : 'Total Budget:' ?></strong> <span style="color: var(--gold); font-size: 16px; font-weight: 800;"><?= number_format($order['budget']) ?> ETB</span></p>
-        </div>
-
-        <!-- የባንክ አካውንቶች መረጃ -->
-        <div class="bank-accounts-box">
-            <p style="color: var(--gold); font-weight: 700; margin-bottom: 12px;">
-                <?= ($current_lang === 'am') ? 'እባክዎን ከዚህ በታች ባሉት የስቱዲዮ አካውንቶች ክፍያውን ይፈጽሙ:' : 'Please make your payment to one of the studio accounts below:' ?>
-            </p>
-            <?php foreach (STUDIO_BANK_ACCOUNTS as $acc): ?>
-                <div class="bank-item">
-                    <h4><i class="fa <?= $acc['icon'] ?>"></i> <?= htmlspecialchars($acc['bank']) ?></h4>
-                    <p><strong>Account Name:</strong> <?= htmlspecialchars($acc['account_name']) ?></p>
-                    <p><strong>Account Number:</strong> <span style="color: var(--gold-light); font-family: monospace; font-size: 15px;"><?= htmlspecialchars($acc['account_number']) ?></span></p>
-                </div>
-            <?php endforeach; ?>
-        </div>
-
-        <!-- የክፍያ ማረጋገጫ ፎርም -->
-        <form action="" method="POST">
-            <div class="form-group">
-                <label><?= ($current_lang === 'am') ? 'የተጠቀሙበት ባንክ / የክፍያ መንገድ' : 'Payment Method Used' ?></label>
-                <select name="payment_method" required>
-                    <option value="Bank of Abyssinia">Bank of Abyssinia (አቢሲኒያ ባንክ)</option>
-                    <option value="Commercial Bank of Ethiopia">Commercial Bank of Ethiopia (ንግድ ባንክ)</option>
-                    <option value="Telebirr">Telebirr (ቴሌብር)</option>
-                    <option value="CBE Birr">CBE Birr (ሲቢኢ ብር)</option>
-                </select>
-            </div>
-
-            <button type="submit" class="btn-submit">
-                <?= ($current_lang === 'am') ? 'ክፍያ ፈጽሜአለሁ አረጋግጥ →' : 'Confirm Payment Completed →' ?>
-            </button>
-        </form>
-    </div>
-</div>
-
-</body>
-</html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title><?= e($page_title) ?></title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+:root{--bg:#0b0b0b;--card:#121316;--border:#292b31;--gold:#d4af37;--gold2:#f2d16b;--muted:#a4a7b0;--white:#fff;--red:#ff7777;--green:#70dfa0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--white);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:850px;margin:36px auto;padding:0 16px 50px}.back{display:inline-block;color:var(--gold);text-decoration:none;margin:0 0 20px}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:clamp(20px,4vw,36px);box-shadow:0 15px 45px #0006}h1{font-size:clamp(22px,4vw,29px);margin:0 0 22px}.summary{background:#191a20;border:1px solid var(--border);padding:18px;border-radius:12px;margin-bottom:25px}.summary p{margin:5px 0;color:#ddd}.price{color:var(--gold2);font-size:20px;font-weight:800}.accounts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0 26px}.bank{border:1px solid var(--border);border-radius:10px;background:#17181e;padding:14px}.bank h3{font-size:15px;color:var(--gold);margin:0 0 8px}.bank p{font-size:13px;margin:4px 0;overflow-wrap:anywhere}.field{margin:18px 0}.field label{display:block;color:#ddd;font-size:14px;margin-bottom:8px}input,select{display:block;width:100%;border:1px solid #363842;background:#191a20;color:white;padding:12px;border-radius:8px;font:inherit}input:focus,select:focus{outline:2px solid #d4af3766;border-color:var(--gold)}.hint{font-size:12px;color:var(--muted);margin-top:6px}.btn{width:100%;border:0;border-radius:9px;background:linear-gradient(135deg,var(--gold2),var(--gold));color:#111;padding:14px;font-weight:800;font-size:15px;cursor:pointer}.alert{padding:13px 15px;border-radius:9px;margin-bottom:18px}.error{background:#471b1b;border:1px solid #8f3838;color:#ffd1d1}.pending{background:#292514;border:1px solid #8e752b;color:#f4dfa0}.disabled{opacity:.6;cursor:not-allowed}@media(max-width:480px){.wrap{margin-top:20px}.card{border-radius:12px}}
+</style></head><body><main class="wrap">
+<a class="back" href="requests.php">← <?= e($t('ወደ ትዕዛዞች ተመለስ','Back to My Requests')) ?></a>
+<section class="card"><h1><?= e($t('የእጅ ክፍያ ማረጋገጫ','Manual Payment Submission')) ?></h1>
+<?php if ($error !== ''): ?><div class="alert error"><?= e($error) ?></div><?php endif; ?>
+<?php if ($alreadySubmitted): ?><div class="alert pending"><?= e($paymentStatus === 'paid' ? $t('ክፍያው ተጸድቋል።','This payment has been approved.') : $t('የክፍያ ማስረጃው ተልኳል፤ Admin እያረጋገጠው ነው።','Your payment proof was submitted and is awaiting admin verification.')) ?></div><?php endif; ?>
+<div class="summary"><p><strong><?= e($t('የፕሮጀክት ርዕስ፡','Project:')) ?></strong> <?= e($order['project_title'] ?? '') ?></p><p><strong><?= e($t('የትዕዛዝ ቁጥር፡','Request ID:')) ?></strong> #<?= (int)$request_id ?></p><p><strong><?= e($t('የሚከፈለው መጠን፡','Amount due:')) ?></strong> <span class="price"><?= number_format((float)($order['budget'] ?? 0), 2) ?> ETB</span></p></div>
+<h2 style="font-size:17px;margin:0"><?= e($t('ክፍያውን ወደ አንዱ አካውንት ይላኩ','Transfer payment to one of these accounts')) ?></h2>
+<div class="accounts"><?php foreach (STUDIO_BANK_ACCOUNTS as $acc): ?><div class="bank"><h3><?= e($acc['bank']) ?></h3><p><strong><?= e($t('የአካውንት ስም፡','Account name:')) ?></strong> <?= e($acc['account_name']) ?></p><p><strong><?= e($t('የአካውንት ቁጥር፡','Account number:')) ?></strong> <?= e($acc['account_number']) ?></p></div><?php endforeach; ?></div>
+<?php if (!$alreadySubmitted): ?><form method="post" enctype="multipart/form-data">
+<?= csrf_field() ?>
+<div class="field"><label for="payment_method"><?= e($t('የተጠቀሙበት የክፍያ መንገድ','Payment method')) ?></label><select id="payment_method" name="payment_method" required><option value="">— <?= e($t('ይምረጡ','Choose')) ?> —</option><?php foreach ($methods as $method): ?><option value="<?= e($method) ?>" <?= post('payment_method') === $method ? 'selected' : '' ?>><?= e($method) ?></option><?php endforeach; ?></select></div>
+<div class="field"><label for="payment_reference"><?= e($t('Transaction / Reference Number (ካለ)','Transaction / Reference Number (if available)')) ?></label><input id="payment_reference" name="payment_reference" type="text" maxlength="100" value="<?= e(post('payment_reference')) ?>" placeholder="e.g. transaction ID"><div class="hint"><?= e($t('በደረሰኝዎ ላይ የሚታየውን የግብይት ቁጥር ያስገቡ።','Enter the transaction ID shown on your receipt.')) ?></div></div>
+<div class="field"><label for="payment_slip"><?= e($t('የክፍያ ደረሰኝ / Screenshot *','Payment receipt / screenshot *')) ?></label><input id="payment_slip" name="payment_slip" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf" required><div class="hint"><?= e($t('JPG, PNG, WEBP ወይም PDF፤ ከፍተኛ 5 MB።','JPG, PNG, WEBP or PDF; maximum 5 MB.')) ?></div></div>
+<button class="btn" type="submit"><?= e($t('ደረሰኝ ላክ ለማረጋገጫ →','Submit Receipt for Verification →')) ?></button>
+</form><?php endif; ?>
+<p class="hint" style="margin-top:18px"><?= e($t('ማስታወሻ፡ ክፍያው በAdmin እስኪረጋገጥ ድረስ ሁኔታው Paid አይሆንም።','Note: payment remains pending until an administrator verifies the receipt.')) ?></p>
+</section></main></body></html>

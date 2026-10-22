@@ -445,7 +445,7 @@ if (file_exists(__DIR__ . '/../includes/header.php')) {
     </div>
 </div>
 
-<?php 
+<?php
 if (file_exists(__DIR__ . '/../includes/footer.php')) {
     require_once __DIR__ . '/../includes/footer.php';
 }
